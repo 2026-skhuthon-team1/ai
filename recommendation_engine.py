@@ -2,9 +2,23 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
+
+from dotenv import load_dotenv
+
+
+load_dotenv(Path(__file__).with_name(".env"))
+load_dotenv()
+
+
+def _get_env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
 
 
 DAYS = ("월", "화", "수", "목", "금", "토", "일")
@@ -12,6 +26,8 @@ WEEKDAYS = set(DAYS[:5])
 FIRST_PERIOD_START_MINUTES = 9 * 60
 FIRST_PERIOD_END_MINUTES = 10 * 60
 SPACE_GAP_MINUTES = 2 * 60
+DEFAULT_LLM_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+DEFAULT_LLM_CANDIDATE_LIMIT = _get_env_int("LLM_CANDIDATE_LIMIT", 0)
 
 
 TIMETABLE_ALIASES = {
@@ -440,6 +456,13 @@ def rank(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return ranked_list
 
 
+def build_tie_breakers(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    tie_breakers = rank(candidates)
+    for index, item in enumerate(tie_breakers):
+        item["tieBreakerRank"] = index + 1
+    return tie_breakers
+
+
 def top_n(ranked_list: list[dict[str, Any]], count: int = 3) -> list[dict[str, Any]]:
     recommendations = []
     for index, item in enumerate(ranked_list[:count]):
@@ -454,16 +477,232 @@ def top_n(ranked_list: list[dict[str, Any]], count: int = 3) -> list[dict[str, A
     return recommendations
 
 
-def filter_payload(payload: Any, top_n_count: int = 3) -> dict[str, Any]:
-    timetables = extract_timetables(payload)
-    ranked = rank(timetables)
-    recommendations = top_n(ranked, top_n_count)
+def _find_timetable_by_id(candidates: list[dict[str, Any]], timetable_id: Any) -> dict[str, Any] | None:
+    formatted_target = format_timetable_id(timetable_id)
+    for candidate in candidates:
+        if format_timetable_id(get_timetable_id(candidate)) == formatted_target:
+            return candidate
+    return None
 
+
+def _summarize_courses(timetable: dict[str, Any]) -> list[dict[str, Any]]:
+    courses = []
+    for course in get_courses(timetable)[:8]:
+        courses.append(
+            {
+                "name": get_course_name(course),
+                "category": _get_any(course, TIMETABLE_ALIASES["course_category"], ""),
+                "credits": _get_any(course, TIMETABLE_ALIASES["course_credits"], ""),
+                "times": iter_course_time_texts(course) or iter_course_time_blocks(course),
+            }
+        )
+    return courses
+
+
+def _summarize_timetable_for_llm(timetable: dict[str, Any], tie_breaker_item: dict[str, Any]) -> dict[str, Any]:
     return {
+        "timetableId": format_timetable_id(get_timetable_id(timetable)),
+        "tags": build_recommendation_tags(timetable),
+        "freeDays": _sort_days(get_free_days(timetable).intersection(WEEKDAYS)),
+        "commuteDays": get_commute_days(timetable),
+        "firstPeriodCount": count_first_periods(timetable),
+        "hasLunchBreak": has_lunch_break(timetable),
+        "hasSpaceGap": has_space_gap(timetable),
+        "maxSameDayGapMinutes": get_max_same_day_gap_minutes(timetable),
+        "requiredMajorCount": count_required_major_courses(timetable),
+        "graduationGuidanceCount": count_graduation_guidance_courses(timetable),
+        "tieBreakerRank": tie_breaker_item["tieBreakerRank"],
+        "tieBreakerReason": tie_breaker_item["reason"],
+        "courses": _summarize_courses(timetable),
+    }
+
+
+def _summarize_user_preferences(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+
+    for key in ("preferences", "preference", "options", "userOptions", "condition", "conditions"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            return value
+
+    return {}
+
+
+def _build_llm_prompt(
+    payload: Any,
+    candidates: list[dict[str, Any]],
+    tie_breakers: list[dict[str, Any]],
+    top_n_count: int,
+    candidate_limit: int,
+) -> str:
+    tie_breaker_by_id = {format_timetable_id(item["id"]): item for item in tie_breakers}
+    summarized_candidates = []
+
+    llm_candidates = candidates if candidate_limit <= 0 else candidates[:candidate_limit]
+
+    for timetable in llm_candidates:
+        timetable_id = format_timetable_id(get_timetable_id(timetable))
+        tie_breaker_item = tie_breaker_by_id[timetable_id]
+        summarized_candidates.append(_summarize_timetable_for_llm(timetable, tie_breaker_item))
+
+    body = {
+        "task": f"시간표 후보를 직접 평가해 0~100점 점수를 매기고, 가장 적합한 Top {top_n_count}개를 고르세요.",
+        "selectionRules": [
+            "반드시 candidates 안에 있는 timetableId만 선택하세요.",
+            "rank는 1부터 시작하고 중복 없이 반환하세요.",
+            "score는 LLM이 직접 산정한 0~100 사이 숫자로 반환하세요.",
+            "사용자 조건이 있으면 사용자 조건을 최우선으로 반영하세요.",
+            "시간표 품질은 졸업지도 중복, 전공필수 포함, 등교일 수, 점심시간, 긴 공강, 1교시, 빠른 종료를 종합해서 판단하세요.",
+            "응답에는 timetableId, rank, score, tags만 포함하세요.",
+        ],
+        "tieBreakerRules": [
+            "LLM이 두 후보에 같은 score를 부여할 정도로 우열이 비슷하면 tieBreakerRank가 더 작은 후보를 우선하세요.",
+            "tieBreakerRank는 이전에 합의한 규칙을 반영합니다: 졸업지도 중복 감점, 전공필수 우대, 등교일 적음 우대, 점심시간 보장 우대, 우주공강 감점, 1교시 감점, 빠른 종료 우대.",
+            "점수가 다르면 tieBreakerRank를 사용하지 말고 LLM이 산정한 score를 우선하세요.",
+        ],
+        "userPreferences": _summarize_user_preferences(payload),
+        "candidates": summarized_candidates,
+    }
+    return json.dumps(body, ensure_ascii=False)
+
+
+def _parse_llm_json(content: str) -> dict[str, Any]:
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", content, flags=re.DOTALL)
+        if not match:
+            raise
+        return json.loads(match.group(0))
+
+
+def _get_google_api_key() -> str | None:
+    return os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+
+
+def _normalize_llm_recommendations(
+    llm_result: dict[str, Any],
+    tie_breakers: list[dict[str, Any]],
+    top_n_count: int,
+) -> list[dict[str, Any]]:
+    tie_breaker_by_id = {format_timetable_id(item["id"]): item for item in tie_breakers}
+    normalized = []
+    seen = set()
+
+    for item in llm_result.get("recommendations", []):
+        timetable_id = format_timetable_id(item.get("timetableId"))
+        if timetable_id in seen or timetable_id not in tie_breaker_by_id:
+            continue
+
+        fallback = tie_breaker_by_id[timetable_id]
+        normalized.append(
+            {
+                "timetableId": timetable_id,
+                "rank": int(item.get("rank", len(normalized) + 1)),
+                "score": float(item.get("score", fallback["score"])),
+                "tags": item.get("tags") or fallback.get("tags", []),
+            }
+        )
+        seen.add(timetable_id)
+
+    normalized.sort(
+        key=lambda item: (
+            item["score"],
+            -tie_breaker_by_id[item["timetableId"]]["tieBreakerRank"],
+        ),
+        reverse=True,
+    )
+
+    for index, item in enumerate(normalized[:top_n_count]):
+        item["rank"] = index + 1
+
+    return normalized[:top_n_count]
+
+
+def recommend_with_llm(
+    payload: Any,
+    candidates: list[dict[str, Any]],
+    tie_breakers: list[dict[str, Any]],
+    top_n_count: int = 3,
+    model: str = DEFAULT_LLM_MODEL,
+    candidate_limit: int = DEFAULT_LLM_CANDIDATE_LIMIT,
+) -> list[dict[str, Any]]:
+    from google import genai
+    from google.genai import types
+    from pydantic import BaseModel
+
+    api_key = _get_google_api_key()
+    if not api_key:
+        raise ValueError("GOOGLE_API_KEY or GEMINI_API_KEY is required for Gemini ranking")
+
+    class LlmRecommendation(BaseModel):
+        timetableId: str
+        rank: int
+        score: float
+        tags: list[str]
+
+    class LlmRecommendationResponse(BaseModel):
+        recommendations: list[LlmRecommendation]
+
+    client = genai.Client(api_key=api_key)
+    prompt = _build_llm_prompt(payload, candidates, tie_breakers, top_n_count, candidate_limit)
+
+    response = client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=(
+                "당신은 대학생 시간표 추천 전문가입니다. "
+                "규칙 점수를 받지 않고 후보 시간표를 직접 평가해 점수와 Top 3 추천 결과만 JSON으로 반환합니다. "
+                "각 추천 항목에는 timetableId, rank, score, tags만 포함합니다."
+            ),
+            temperature=0.2,
+            response_mime_type="application/json",
+            response_schema=LlmRecommendationResponse,
+        ),
+    )
+
+    content = response.text or "{}"
+    llm_result = _parse_llm_json(content)
+    recommendations = _normalize_llm_recommendations(llm_result, tie_breakers, top_n_count)
+
+    if not recommendations:
+        raise ValueError("LLM did not return valid recommendations")
+
+    return recommendations
+
+
+def filter_payload(
+    payload: Any,
+    top_n_count: int = 3,
+    use_llm: bool = True,
+    llm_model: str = DEFAULT_LLM_MODEL,
+) -> dict[str, Any]:
+    timetables = extract_timetables(payload)
+    tie_breakers = build_tie_breakers(timetables)
+    recommendation_source = "rule"
+    llm_error = None
+
+    if use_llm and _get_google_api_key():
+        try:
+            recommendations = recommend_with_llm(payload, timetables, tie_breakers, top_n_count, llm_model)
+            recommendation_source = "llm"
+        except Exception as exc:
+            llm_error = str(exc)
+            recommendations = top_n(tie_breakers, top_n_count)
+    else:
+        recommendations = top_n(tie_breakers, top_n_count)
+
+    result = {
         "count": len(timetables),
         "top_n": top_n_count,
+        "source": recommendation_source,
         "recommendations": recommendations,
     }
+    if llm_error:
+        result["llm_error"] = llm_error
+    return result
 
 
 def resolve_default_input(script_dir: Path) -> Path:
@@ -486,13 +725,15 @@ def main() -> None:
     parser.add_argument("--input", required=False, help="Path to timetable candidates JSON.")
     parser.add_argument("--output", required=False, help="Optional path to save recommendation result JSON.")
     parser.add_argument("--top-n", type=int, default=3, help="Number of recommendations to return.")
+    parser.add_argument("--no-llm", action="store_true", help="Disable LLM ranking and use rule-based ranking only.")
+    parser.add_argument("--model", default=DEFAULT_LLM_MODEL, help="Gemini model name for LLM ranking.")
     args = parser.parse_args()
 
     script_dir = Path(__file__).parent
     input_path = resolve_path(args.input, resolve_default_input(script_dir), script_dir)
 
     payload = json.loads(input_path.read_text(encoding="utf-8"))
-    result = filter_payload(payload, top_n_count=args.top_n)
+    result = filter_payload(payload, top_n_count=args.top_n, use_llm=not args.no_llm, llm_model=args.model)
     recommendations_json = json.dumps(result["recommendations"], ensure_ascii=False, indent=2)
 
     if args.output:
